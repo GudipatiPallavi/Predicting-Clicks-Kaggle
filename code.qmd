@@ -1,0 +1,159 @@
+```{r}
+# Loading the required libraries for the code
+library(tidyverse)
+library(xgboost)
+library(caret)
+#install.packages('dplyr')
+library(dplyr)
+
+# loading the csv data files
+analysis_data <- read.csv("analysis_data.csv")
+scoring_data <- read.csv("scoring_data.csv")
+
+# Step 1: Data cleaning - First handle the missing values from data given - replacing the missing numeric values with the column means
+analysis_data <- analysis_data |>
+  mutate(across(where(is.numeric), 
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+scoring_data <- scoring_data |>
+  mutate(across(where(is.numeric), 
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Step 2: convert  the categorical columns to dummy var
+categorical_col <- c("position_on_page", "ad_format", "gender", "age_group", 
+                      "location","day_of_week", "time_of_day", "device_type")
+
+dummies <- dummyVars(~ ., data = analysis_data[categorical_col], fullRank = TRUE)
+analysis_data_encoded <- predict(dummies, newdata = analysis_data) |>
+  as.data.frame()
+scoring_data_encoded <- predict(dummies, newdata = scoring_data) |> 
+  as.data.frame()
+
+# Combine encoded categorical data with remaining columns
+analysis_data_final <- cbind(analysis_data |>
+                               select(-all_of(categorical_col)), analysis_data_encoded)
+scoring_data_final <- cbind(scoring_data |> 
+                              select(-all_of(categorical_col)), scoring_data_encoded)
+
+# Step 3: split the Train-Test data
+set.seed(1031)
+train_index <- createDataPartition(analysis_data_final$CTR, p = 0.8, list = FALSE)
+train_data <- analysis_data_final[train_index, ]
+test_data <- analysis_data_final[-train_index, ]
+
+# Step 4:convert  the data to DMatrix for xgboost
+dtrain <- xgb.DMatrix(data = as.matrix(train_data |> 
+                                         select(-CTR)), label = train_data$CTR)
+dtest <- xgb.DMatrix(data = as.matrix(test_data |> 
+                                        select(-CTR)), label = test_data$CTR)
+
+# Step 5: set up xgboost parameters and train the Model
+params <- list(
+  objective = "reg:squarederror",           # Regression objective for RMSE minimization
+  max_depth = 1,                            # depth of the tree
+  eta = 0.01,                               # Lower learning rate
+  subsample = 0.6,                          # fraction of data used per tree
+  colsample_bytree = 0.8,                   # fraction of features used per tree
+  eval_metric = "rmse"
+)
+
+# cross-validate to find optimal nrounds
+cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 50000,
+  nfold = 10,
+  early_stopping_rounds = 200,
+  verbose = 0
+)
+
+# best number of rounds from cross-validation
+best_nrounds <- cv$best_iteration
+
+# setting up the xgboost parameters and train the model
+params <- list(
+  objective = "reg:squarederror",           
+  max_depth = 1,
+  eta = 0.01, 
+  subsample = 0.6,
+  colsample_bytree = 0.8,
+  eval_metric = "rmse"
+)
+
+# cross-validate to find the optimal nrounds
+cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 50000,
+  nfold = 10,
+  early_stopping_rounds = 200,
+  verbose = 0
+)
+
+# best number of rounds from cross-validation
+best_nrounds <- cv$best_iteration
+
+# train final xgboost model using best nrounds
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 200,
+  verbose = 0
+)
+
+
+# Step 6: evaluate model on test set
+test_predictions <- predict(xgb_model, newdata = dtest)
+test_rmse <- RMSE(test_predictions, test_data$CTR)
+print(paste("Test RMSE:", test_rmse))
+
+
+
+# Step 7: check and compare the Feature Names to identify any differences
+train_features <- colnames(as.matrix(train_data |>
+                          select(-CTR)))
+score_features <- colnames(as.matrix(scoring_data_final))
+
+# check if all features match, just for my verification
+print("training data features:")
+train_features
+print("scoring data features:")
+score_features
+
+# Step 8: identify missing and extra columns
+missing_in_score <- setdiff(train_features, score_features)
+extra_in_score <- setdiff(score_features, train_features)
+
+if (length(missing_in_score) > 0) {
+  print("Features in training data but missing in scoring data:")
+  missing_in_score
+}
+
+if (length(extra_in_score) > 0) {
+  print("Extra features in scoring data but not in training data:")
+  extra_in_score
+}
+
+# Step 9: adjust columns in Scoring Data to match  with training data and add missing columns to scoring_data_final if needed (for checking the columns, we made a print of data in step 7)
+for (col in missing_in_score) {
+  scoring_data_final[[col]] <- 0
+}
+
+# Remove any extra columns from scoring_data_final that are not in train_data
+scoring_data_final <- scoring_data_final |>
+  select(all_of(train_features))  
+
+
+# Step 10: converting into DMatrix and check CTR column is not present in scoring_data_final during prediction
+dscore <- xgb.DMatrix(data = as.matrix(scoring_data_final))
+
+# predict the CTR on scoring data
+scoring_data_final$CTR <- predict(xgb_model, newdata = dscore)
+
+
+# Step 12: save the predictions and get the csv file
+write.csv(scoring_data_final[, c("id", "CTR")], "CTR_predict_xgboost_try.csv", row.names = FALSE)
+```
+
+
